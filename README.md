@@ -17,10 +17,15 @@ python example_register.py
 ```
 musepy/
   client.py    注册 + 兑换的完整协议客户端
+  runner.py    多账号批量调度（sticky 代理 / 预算 / 停止语义）
+  otp.py       验证码轮询（幂等：只取 send 之后的最新码）
   falco.py     行为埋点上报（可选）
   caa.py       注册漏斗事件上报（可选）
-example_register.py   端到端示例
-config.example.json   配置模板
+example_register.py        单账号端到端示例
+example_batch.py           多账号批量示例
+config.example.json        配置模板
+test_onboarding_smoke.py   离线冒烟（披露解析纯函数）
+test_runner_smoke.py       离线冒烟（批量调度，mock 网络）
 ```
 
 ## 协议流程
@@ -29,14 +34,19 @@ config.example.json   配置模板
 GET  /                                   拿初始 cookie
 POST /api/auth/native/restart            → 201 {csrf_token}
 POST /api/auth/native/send-otp           → 201
-POST /api/auth/native/confirm-otp        → 200 {registration_state:"completion_required"}
+POST /api/auth/native/confirm-otp        → 200 {registration_state:"completion_required",
+                                               tos:{content_version}}（动态 TOS 版本）
 POST /api/auth/native/register-completion→ 200 {auth_meta_session:{frl_access_token, frl_account_id}}
-POST /api/hatch/accept-tos               → 200（激活会话，必须）
+POST auth.meta.com/hatch/session/bootstrap/ → 302…→ muse.ai 200 HTML（会话引导，必须）
+     └ 从 muse.ai 文档解析动态披露 disclosure_text/disclosure_version 与状态门
+       （resolvedDestination/isGeoGated/waitlist → 地区受限）
+POST /api/hatch/accept-tos               → 200（单次调用；正文用服务端动态披露，非硬编码）
 GET  /api/hatch/invite                   → 200 表示账号有效
-POST /api/hatch/vm/wake                  → 200（必须，否则兑换误报 invalid）
+POST /api/hatch/vm/wake                  → 200（必须，否则兑换误报 invalid；
+                                             wake_trigger=mount + open_id + away_ms=0）
 POST /api/hatch/stateful-sharing         → 200
 POST /api/hatch/invite-code/redeem       → 200 {redemptionStatus:"redeemed"}
-POST /api/hatch/invite                   → 200 {code}（刮出自己的码）
+POST /api/hatch/invite                   → 200 {code}（取回自己的码，不等于页面刮开 reveal）
 ```
 
 ## 几个容易踩的坑
@@ -67,9 +77,17 @@ POST /api/hatch/invite                   → 200 {code}（刮出自己的码）
 {"resume": false}
 ```
 
-### 4. `accept-tos` 是会话激活开关
+### 4. `accept-tos` 是会话激活开关，且必须先引导会话
 
-注册完成后 `GET /api/hatch/invite` 会是 403。必须先调 `accept-tos`，且 `disclosure_text` 要填完整日文文案（不是随便一个字符串），之后 invite 才返回 200。
+注册完成后**必须先走 `POST auth.meta.com/hatch/session/bootstrap/`**（form 表单只带
+`frl_access_token`，手动跟随 302/301/303 跳转落到 muse.ai 200 文档），否则后续
+hatch 接口一律 403。引导落地的 muse.ai 文档里带有 Next Flight 序列化的动态披露
+（`disclosureText` / `disclosureVersion`，当前实测版本为 `HATCH_ROW_v0`），`accept-tos`
+的正文必须用服务端返回的这份动态文案（**不是**硬编码常量），`Referer` 用披露页
+URL；单次调用即可，不重试，403 时把响应体前 200 字符带出来便于诊断。
+
+引导后若服务端判定 `resolvedDestination == "waitlist"` 或 `isGeoGated == true`，
+属于**地区受限**：注册已完成、账号保留，但未证明已加入名单。
 
 ### 5. `vm/wake` 缺失会让兑换误报
 
@@ -85,6 +103,9 @@ POST /api/hatch/invite                   → 200 {code}（刮出自己的码）
 re.search(r'vmId[\\"]*:[\\"]*([0-9a-fA-F-]{36})', html)
 ```
 
+`wake` 的 body 实测为：`wake_trigger: "mount"`（首连）、`open_id`（新 uuid）、
+`away_ms: 0`，而不是早期的 `resume`。
+
 ### 6. 兑换失败原因的含义
 
 | reason | 含义 |
@@ -97,6 +118,45 @@ re.search(r'vmId[\\"]*:[\\"]*([0-9a-fA-F-]{36})', html)
 ## Cookie
 
 注册成功后 `hatch_sess` 由 `register-completion` 的响应头下发（约 886 字符），这是后续所有 hatch 接口的凭证。`hatch_vml` 在注册阶段一直是被清空状态（`Max-Age=0`），不属于必需项。
+
+## 多账号批量（musepy/runner.py）
+
+```bash
+python example_batch.py [count]
+```
+
+`config.json` 里的批量字段：
+
+| 字段 | 说明 |
+|---|---|
+| `otp_file` | 邮箱清单，每行 `email----otp源URL`（otp 源返回 `[{"otp","time"},...]` JSON） |
+| `proxy_file` | sticky 代理池，每行 `host:port:user:pass`（或 `host:port`） |
+| `codes_file` | 可选，待兑换邀请码池，每行一个 |
+| `output_dir` / `tried_file` | 每账号结果 JSON 目录 / 已尝试邮箱清单 |
+| `workers` / `max_per_ip` | worker 数（默认 5）/ 每条代理的验证成功上限（默认 6） |
+| `resolve_ip` | 是否通过 ipify 解析出口 IP（默认 true） |
+| `send_caa` | 批量模式下是否上报注册漏斗埋点 |
+
+调度语义（与本地实现一致，不承诺任何绕过行为）：
+
+- **worker 独占 sticky 代理**：一条代理行同一时刻只归一个 worker（claim/release），
+  不抢他人的行；代理池耗尽才共享并打日志。
+- **max_per_ip 按验证成功数计**：达到上限释放当前行并换另一行，原行本轮避开。
+- **pre-send 传输失败重试**：`bootstrap`/`restart` 等**未发出 OTP 前**的网络失败，
+  释放当前代理并**同邮箱换代理重试，上限 3 次**，不消耗新邮箱；仍失败标记 tried。
+- **业务拒绝 / pending / 已发 OTP 后的失败：整批停止**——不换行、不重试、不补号。
+- **region_waitlist**：账号已注册但地区受限——记录 `registered_waitlist`、账号保留，
+  整批停止。
+- **预算 = 领取的不同邮箱数**：失败不补号；结束打印 batch_summary JSON
+  （queued/started/remaining/ok/pending/server_rejected/transport_error/failed/
+  ip_switches/stopped/stop_reason）。
+
+每账号结果写入 `output_dir/<email>.json`，字段：`email/status/stage/registered/
+own_code/own_code_status/reveal_status/is_revealed/ip/last_error`。
+`frl_access_token` 与 `hatch_sess` 仅在内存中使用，**不落盘**。
+
+OTP 轮询幂等：每次 `send_otp` 前记录开始时间，`musepy/otp.py` 只取该时间之后的
+最新 6 位验证码（45 秒超时、0.6 秒间隔、单请求 15 秒超时）。
 
 ## 埋点说明
 

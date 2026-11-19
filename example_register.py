@@ -27,7 +27,7 @@ def main():
     invite_code = cfg.get("invite_code") or ""
     otp_file = cfg.get("otp_file")  # 可选：从文件读取当前验证码
 
-    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome131"),
+    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome142"),
                    lang=cfg.get("lang", "ja"))
 
     print(f"[1] 打开首页  {email}")
@@ -83,27 +83,29 @@ def main():
             falco.interaction("https://muse.ai/", "page_load", "main_app", "page_load"),
         ])
 
-    print("[6] 激活会话（accept-tos）")
-    for _ in range(2):
-        c.accept_tos()
-        if c.is_live():
-            break
-        time.sleep(1.2)
+    print("[6] 引导会话（session bootstrap，缺失会全链 403）")
+    token = (data.get("auth_meta_session") or {}).get("frl_access_token")
+    onboarding = c.activate_session(token)
+    print(f"    resolved_destination = {onboarding.get('resolved_destination')}")
+    print(f"    disclosure_version   = {onboarding.get('disclosure_version')}")
+
+    print("[7] 激活会话（accept-tos，单次调用，正文取服务端动态披露）")
+    c.accept_tos(onboarding)
     print(f"    invite = {'200 活号' if c.is_live() else '401/403 无 hatch 权限'}")
 
-    print("[7] 唤醒 VM")
+    print("[8] 唤醒 VM（wake_trigger=mount, open_id, away_ms=0）")
     vm = c.wake_vm()
     print(f"    vm_id = {vm}")
 
     c.stateful_sharing()
 
-    print(f"[8] 兑换邀请码  {invite_code or '(未配置)'}")
+    print(f"[9] 兑换邀请码  {invite_code or '(未配置)'}")
     if invite_code:
         ok, reason = c.redeem(invite_code)
         print(f"    redeem = {ok} / {reason}")
         if ok:
             own = c.scratch_code()
-            print(f"[9] 自己的邀请码 = {own}")
+            print(f"[10] 自己的邀请码（POST invite 取回，非页面刮开）= {own}")
         else:
             print(f"    失败原因映射: already_redeemed=本账号已用过码  "
                   f"used_up=该码已达使用上限  invalid=码不存在")
@@ -119,5 +121,10 @@ if __name__ == "__main__":
     try:
         main()
     except MuseError as e:
-        print(f"协议失败: {e}")
+        if "region_waitlist" in str(e):
+            # 引导后服务端判定地区受限：注册已完成、账号保留，但未证明已加入名单
+            print(f"地区受限: {e}")
+            print("    说明：账号已注册但地区受限，未加入名单；请检查出口节点地区")
+        else:
+            print(f"协议失败: {e}")
         sys.exit(1)
